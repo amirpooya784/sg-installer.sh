@@ -809,13 +809,26 @@ sg_restart_services() {
 # ══════════════════════════════════════════════════════════════════════
 #  MODULE: install / remove / repair
 # ══════════════════════════════════════════════════════════════════════
-sg_verify() {                   # verify PHP still runs AND loader is active
-    local bin="$1" out
+SG_VERIFY_OUT=""
+sg_verify() {                   # 0 = ok, 1 = not loaded, 2 = PHP is broken
+    local bin="$1" out errs
     out="$("$bin" -v 2>&1)"
-    if grep -qi 'failed loading\|unable to load dynamic library\|segmentation fault' <<<"$out"; then
-        sg_log ERROR "verify: $out"; return 2
+    SG_VERIFY_OUT="$out"
+    sg_log INFO "verify php -v: $(tr '\n' '|' <<<"$out")"
+
+    errs="$(grep -Ei 'failed loading|unable to load|undefined symbol|segmentation fault|cannot load' <<<"$out")"
+    if [[ -n "$errs" ]]; then
+        if grep -qiE 'ixed|sourceguardian' <<<"$errs"; then
+            SG_VERIFY_OUT="$errs"
+            return 2                      # OUR loader is the broken one
+        fi
+        # a pre-existing problem with some OTHER extension must not trigger
+        # a rollback of a perfectly good SourceGuardian install
+        sg_warn "PHP reports an unrelated extension problem (left untouched):"
+        printf '     %s%s%s\n' "$C_DIM" "$(head -2 <<<"$errs")" "$C_RESET"
     fi
-    "$bin" -r 'exit(0);' >/dev/null 2>&1 || { sg_log ERROR "verify: php cannot execute"; return 2; }
+
+    "$bin" -r 'exit(0);' >/dev/null 2>&1 || { SG_VERIFY_OUT="php cannot execute any script"; return 2; }
     grep -qi 'sourceguardian' <<<"$out" && return 0
     "$bin" -r 'exit(extension_loaded("sourceguardian") ? 0 : 1);' >/dev/null 2>&1
 }
@@ -842,9 +855,14 @@ sg_install_one() {              # sg_install_one BIN TAG
         mkdir -p "${P_SCAN[$bin]}" 2>/dev/null; chmod 0755 "${P_SCAN[$bin]}" 2>/dev/null
     fi
 
-    if ! install -m 0755 -o root -g root "$src" "$target" 2>>"$SG_LOG_FILE"; then
-        sg_err "Could not copy loader to $target"; sg_rollback; return 1
+    # atomic replace: write beside the target, then rename. Overwriting the
+    # file in place breaks workers that already have it mapped.
+    local staged="${target}.sgnew.$$"
+    if ! install -m 0755 "$src" "$staged" 2>>"$SG_LOG_FILE" || ! mv -f "$staged" "$target" 2>>"$SG_LOG_FILE"; then
+        rm -f "$staged"
+        sg_err "Could not place loader at $target"; sg_rollback; return 1
     fi
+    chown root:root "$target" 2>/dev/null
 
     sg_ini_disable_conflicts "$bin" "$ini_target"
     if ! sg_ini_write "$bin" "$ini_target" "$target"; then
@@ -852,11 +870,17 @@ sg_install_one() {              # sg_install_one BIN TAG
     fi
 
     sg_verify "$bin"; rc=$?
-    if (( rc == 2 )); then
-        sg_err "PHP ${P_VER[$bin]} became unstable -- rolling back."
-        sg_rollback; return 1
-    elif (( rc != 0 )); then
-        sg_err "Loader installed but not reported by PHP ${P_VER[$bin]} -- rolling back."
+    if (( rc != 0 )); then
+        if (( rc == 2 )); then
+            sg_err "PHP ${P_VER[$bin]} refuses the loader -- rolling back."
+        else
+            sg_err "Loader installed but PHP ${P_VER[$bin]} does not report it -- rolling back."
+        fi
+        printf '     %s%s%s\n' "$C_DIM" "PHP said:" "$C_RESET"
+        printf '     %s%s%s\n' "$C_YLW" "$(head -3 <<<"${SG_VERIFY_OUT:-<no output>}")" "$C_RESET"
+        sg_ui_info "loader : $target"
+        sg_ui_info "ini    : $ini_target"
+        sg_ui_info "Full output: $SG_LOG_FILE"
         sg_rollback; return 1
     fi
 
@@ -978,6 +1002,26 @@ sg_scan() {
     return 0
 }
 
+sg_diagnose() {
+    sg_php_discover || return 1
+    local bin f
+    for bin in "${SG_PHP[@]}"; do
+        sg_ui_title "PHP ${P_VER[$bin]} -- $bin"
+        sg_ui_kv "extension_dir" "${P_EXTDIR[$bin]}"
+        sg_ui_kv "php.ini"       "${P_INI[$bin]:-(none)}"
+        sg_ui_kv "scan dir"      "${P_SCAN[$bin]:-(none)}"
+        sg_ui_kv "expected"      "${P_LOADER[$bin]} (${P_TS[$bin]})"
+        sg_ui_kv "loader file"   "$( [[ -f "${P_EXTDIR[$bin]}/${P_LOADER[$bin]}" ]] && stat -c '%s bytes, mode %a' "${P_EXTDIR[$bin]}/${P_LOADER[$bin]}" || echo 'missing')"
+        printf '\n   %sphp -v:%s\n' "$C_BOLD" "$C_RESET"
+        "$bin" -v 2>&1 | sed 's/^/     /'
+        printf '\n   %sini files mentioning a loader:%s\n' "$C_BOLD" "$C_RESET"
+        grep -rniE '(zend_)?extension[[:space:]]*=.*(ixed|sourceguardian)' \
+             "${P_SCAN[$bin]:-/dev/null}" "${P_INI[$bin]:-/dev/null}" 2>/dev/null | sed 's/^/     /' \
+             || printf '     (none)\n'
+    done
+    return 0
+}
+
 sg_view_log() {
     sg_ui_title "Last 60 log lines -- $SG_LOG_FILE"
     [[ -r "$SG_LOG_FILE" ]] && tail -n 60 "$SG_LOG_FILE" | sed 's/^/   /' || sg_ui_warn "No log yet."
@@ -1022,6 +1066,7 @@ sg_menu() {
         printf '    %s10%s  Download loader archive only\n'      "$C_BOLD" "$C_RESET"
         printf '    %s11%s  View log\n'                          "$C_BOLD" "$C_RESET"
         printf '    %s12%s  Self update\n'                       "$C_BOLD" "$C_RESET"
+        printf '    %s13%s  Diagnose (why did it fail?)\n'        "$C_BOLD" "$C_RESET"
         printf '\n     %s0%s  Exit\n\n'                          "$C_BOLD" "$C_RESET"
         sg_ask choice "   ${C_CYN}❯${C_RESET} Select: " || return 0
         case "$(sg_trim "$choice")" in
@@ -1041,6 +1086,7 @@ sg_menu() {
             10) sg_download 1; sg_ui_pause ;;
             11) sg_view_log; sg_ui_pause ;;
             12) sg_self_update; sg_ui_pause ;;
+            13) sg_diagnose; sg_ui_pause ;;
             0|q|Q|exit) printf '\n   %sBye.%s\n\n' "$C_DIM" "$C_RESET"; return 0 ;;
             *) sg_ui_warn "Invalid choice."; sleep 1 ;;
         esac
@@ -1062,6 +1108,7 @@ SourceGuardian Loader Manager v$SG_VERSION
     --download           only download + verify the loader archive
     --sysinfo            system information
     --log                show recent log lines
+    --diagnose           dump loader paths, php -v and every loader ini line
     --self-update        update this script (needs SG_SELF_URL)
     -y, --yes            assume "yes" for all prompts
     --no-color           disable colours
@@ -1101,6 +1148,7 @@ main() {
             --download)    action=download ;;
             --sysinfo)     action=sysinfo ;;
             --log)         action=log ;;
+            --diagnose)    action=diagnose ;;
             --self-update) action=selfupdate ;;
             --install)     action=install; [[ "${2:-}" =~ ^[^-] ]] && { arg="$2"; shift; } ;;
             --remove)      action=remove;  [[ "${2:-}" =~ ^[^-] ]] && { arg="$2"; shift; } ;;
@@ -1120,6 +1168,7 @@ main() {
         scan)       sg_ui_banner; sg_scan ;;
         sysinfo)    sg_ui_banner; sg_system_info ;;
         log)        sg_view_log ;;
+        diagnose)   sg_ui_banner; sg_diagnose ;;
         download)   sg_ui_banner; sg_download 1 ;;
         selfupdate) sg_self_update ;;
         install)    sg_ui_banner; sg_cli_targets "${arg:-all}" && sg_run_targets install "${SG_TARGETS[@]}" ;;
